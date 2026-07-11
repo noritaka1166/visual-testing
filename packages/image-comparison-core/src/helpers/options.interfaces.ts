@@ -1,4 +1,5 @@
 import type { TabbableOptions } from '../commands/tabbable.interfaces.js'
+import type { PixelmatchCompareOptions } from '../pixelmatch/compare.interfaces.js'
 
 export interface ClassOptions {
     // ==================
@@ -159,31 +160,38 @@ export interface ClassOptions {
     diffPixelBoundingBoxProximity?: number;
 
     /**
-     * Ignore alpha channel when comparing images.
+     * Ignore alpha-channel differences during comparison.
+     * Preprocessing sets all alpha values to opaque before pixelmatch runs.
+     * Preset: strict threshold (~16/255), AA not forgiven.
      */
     ignoreAlpha?: boolean;
 
     /**
-     * Forgive anti-aliasing differences when comparing images.
+     * Forgive anti-aliased pixels during comparison (pixelmatch `includeAA: false`).
+     * Preset: relaxed threshold (~32/255), AA forgiven.
+     * When combined with other ignore flags, last-wins order applies
+     * (`alpha` → `antialiasing` → `colors` → `less` → `nothing`).
      * Defaults to `true` so sub-pixel rendering noise is ignored out of the box.
-     * Set to `false` for strict pixel comparison where AA pixels count as mismatches.
+     * Set to `false` for strict comparison where AA pixels count as mismatches.
      */
     ignoreAntialiasing?: boolean;
 
     /**
-     * Compare two images in black and white only.
+     * Compare brightness only, ignoring hue differences.
+     * Preprocessing converts both images to grayscale using resemble luma (`0.3/0.59/0.11`).
+     * Preset: strict threshold (~16/255), AA not forgiven.
      */
     ignoreColors?: boolean;
 
     /**
-     * Compare images with reduced sensitivity.
-     * red = 16, green = 16, blue = 16, alpha = 16, minBrightness = 16, maxBrightness = 240
+     * Use a relaxed RGB tolerance (~16/255 per channel in YIQ space).
+     * Preset: strict threshold, AA not forgiven (does not inherit default AA forgiveness).
      */
     ignoreLess?: boolean;
 
     /**
-     * Compare images with full sensitivity.
-     * red = 0, green = 0, blue = 0, alpha = 0, minBrightness = 0, maxBrightness = 255
+     * Use zero tolerance: any pixel difference counts as a mismatch.
+     * Preset: threshold `0`, AA not forgiven.
      */
     ignoreNothing?: boolean;
 
@@ -209,6 +217,7 @@ export interface ClassOptions {
 
     /**
      * Options object passed to the underlying image comparison engine.
+     * Use either `ignore*` preset flags or a `pixelmatch` object, not both.
      */
     compareOptions?: Partial<CompareOptions>;
 
@@ -402,7 +411,7 @@ export interface DefaultOptions {
     alwaysSaveActualImage: boolean;
 }
 
-export interface CompareOptions {
+export interface SharedServiceCompareOptions {
     /**
      * Automatically block out the side bar for iPads in landscape mode during comparisons.
      * Prevents failures caused by the tab/private/bookmark native component.
@@ -437,33 +446,6 @@ export interface CompareOptions {
     diffPixelBoundingBoxProximity: number;
 
     /**
-     * Compare images and discard the alpha channel.
-     */
-    ignoreAlpha: boolean;
-
-    /**
-     * Forgive anti-aliasing differences when comparing images.
-     */
-    ignoreAntialiasing: boolean;
-
-    /**
-     * Compare two black-and-white versions of the images, ignoring colors.
-     */
-    ignoreColors: boolean;
-
-    /**
-     * Use a less sensitive comparison setting:
-     * red = 16, green = 16, blue = 16, alpha = 16, minBrightness = 16, maxBrightness = 240
-     */
-    ignoreLess: boolean;
-
-    /**
-     * Use the most sensitive comparison setting:
-     * red = 0, green = 0, blue = 0, alpha = 0, minBrightness = 0, maxBrightness = 255
-     */
-    ignoreNothing: boolean;
-
-    /**
      * Return the raw mismatch percentage as a decimal (e.g., `0.12345678`), instead of a rounded value (e.g., `0.12`).
      */
     rawMisMatchPercentage: boolean;
@@ -485,4 +467,65 @@ export interface CompareOptions {
      */
     scaleImagesToSameSize: boolean;
 }
+
+/**
+ * ignore* preset mode. Maps to resemble-style presets.
+ * Cannot be combined with `pixelmatch` on the same options object.
+ */
+export interface IgnorePresetCompareOptions {
+    /**
+     * Ignore alpha-channel differences during comparison.
+     * Preprocessing sets all alpha values to opaque before pixelmatch runs.
+     * Preset: strict threshold (~16/255), AA not forgiven.
+     */
+    ignoreAlpha: boolean;
+
+    /**
+     * Forgive anti-aliased pixels during comparison (pixelmatch `includeAA: false`).
+     * Preset: relaxed threshold (~32/255), AA forgiven.
+     * When combined with other ignore flags, last-wins order applies
+     * (`alpha` → `antialiasing` → `colors` → `less` → `nothing`).
+     */
+    ignoreAntialiasing: boolean;
+
+    /**
+     * Compare brightness only, ignoring hue differences.
+     * Preprocessing converts both images to grayscale using resemble luma (`0.3/0.59/0.11`).
+     * Preset: strict threshold (~16/255), AA not forgiven.
+     */
+    ignoreColors: boolean;
+
+    /**
+     * Use a relaxed RGB tolerance (~16/255 per channel in YIQ space).
+     * Preset: strict threshold, AA not forgiven (does not inherit default AA forgiveness).
+     */
+    ignoreLess: boolean;
+
+    /**
+     * Use zero tolerance: any pixel difference counts as a mismatch.
+     * Preset: threshold `0`, AA not forgiven.
+     */
+    ignoreNothing: boolean;
+
+    /** @deprecated Use preset mode without `pixelmatch`, or direct mode with `pixelmatch` only. */
+    pixelmatch?: never;
+}
+
+/**
+ * Direct pixelmatch mode: full control over threshold, AA, and diff colours.
+ * Omit all `ignore*` keys; cannot be combined with preset mode on the same options object.
+ */
+export interface PixelmatchModeCompareOptions {
+    /**
+     * Direct pixelmatch comparison settings.
+     * Mutually exclusive with all `ignore*` options.
+     */
+    pixelmatch: PixelmatchCompareOptions;
+}
+
+/** Preset or direct pixelmatch compare mode, mutually exclusive per options object. */
+export type ExclusiveCompareOptions = IgnorePresetCompareOptions | PixelmatchModeCompareOptions
+
+/** Service compare options: shared fields plus either preset or direct pixelmatch mode. */
+export type CompareOptions = SharedServiceCompareOptions & ExclusiveCompareOptions
 

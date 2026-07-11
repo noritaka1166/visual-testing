@@ -1,6 +1,9 @@
 import pixelmatch from 'pixelmatch'
+import { resolveComparePreset } from '../helpers/options.js'
+import { DEFAULT_PIXELMATCH_OPTIONS } from '../helpers/constants.js'
+import { applyResembleGrayscale } from './compareBrightness.js'
 import { decodeImage, resizeBilinear, encodeImage, type RawImage } from '../utils/imageUtils.js'
-import type { CompareData, ComparisonOptions, ComparisonIgnoreOption } from './compare.interfaces.js'
+import type { CompareData, ComparisonOptions, ComparisonIgnoreOption, ResolvedPixelmatchOptions } from './compare.interfaces.js'
 
 function resolveIgnoreList(ignore: ComparisonOptions['ignore']): ComparisonIgnoreOption[] {
     if (!ignore) {
@@ -10,35 +13,26 @@ function resolveIgnoreList(ignore: ComparisonOptions['ignore']): ComparisonIgnor
     return Array.isArray(ignore) ? ignore : [ignore]
 }
 
-function toPixelmatchOptions(ignoreList: ComparisonIgnoreOption[]): { threshold: number; includeAA: boolean } {
-    if (ignoreList.includes('nothing')) {
-        return { threshold: 0, includeAA: true }
-    }
+/**
+ * Returns whether a pixelmatch output buffer pixel is a diff, AA, or alt highlight.
+ */
+function isHighlightedPixel(
+    output: Uint8Array,
+    offset: number,
+    diffColor: [number, number, number],
+    aaColor: [number, number, number],
+    diffColorAlt?: [number, number, number],
+): boolean {
+    const r = output[offset]
+    const g = output[offset + 1]
+    const b = output[offset + 2]
 
-    const forgivesAA = ignoreList.includes('antialiasing')
-    const threshold = ignoreList.includes('less')
-        ? 0.063
-        : forgivesAA
-            // Resemble's ignoreAntialiasing uses 32/255 per-channel tolerance which
-            // corresponds to ~0.13 in YIQ perceptual distance.
-            ? 0.13
-            // Default strict tolerance: 16/255 per channel maps to ~6.3% of max YIQ distance.
-            : 0.063
+    const matchesColor = (color: [number, number, number]) =>
+        r === color[0] && g === color[1] && b === color[2]
 
-    return {
-        threshold,
-        // pixelmatch includeAA=true disables AA forgiveness; false enables it.
-        includeAA: !forgivesAA,
-    }
-}
-
-function grayscalePixels(pixels: Buffer, totalPixels: number): void {
-    for (let i = 0; i < totalPixels * 4; i += 4) {
-        const luma = Math.round(0.299 * pixels[i] + 0.587 * pixels[i + 1] + 0.114 * pixels[i + 2])
-        pixels[i] = luma
-        pixels[i + 1] = luma
-        pixels[i + 2] = luma
-    }
+    return matchesColor(diffColor)
+        || matchesColor(aaColor)
+        || (diffColorAlt !== undefined && matchesColor(diffColorAlt))
 }
 
 function opaqueAlphaChannel(pixels: Buffer, totalPixels: number): void {
@@ -115,11 +109,12 @@ export default async function compareImages(
     // screenshot content is always visible, including inside blockout regions.
     const displayPixels2 = Buffer.from(pixels2)
 
-    const ignoreList = resolveIgnoreList(options.ignore)
+    const pixelmatchSettings = options.pixelmatch
+    const ignoreList = pixelmatchSettings ? [] : resolveIgnoreList(options.ignore)
 
     if (ignoreList.includes('colors')) {
-        grayscalePixels(pixels1, totalPixels)
-        grayscalePixels(pixels2, totalPixels)
+        applyResembleGrayscale(pixels1, totalPixels)
+        applyResembleGrayscale(pixels2, totalPixels)
     }
 
     if (ignoreList.includes('alpha')) {
@@ -133,19 +128,32 @@ export default async function compareImages(
         zeroIgnoredBoxes(pixels2, width, ignoredBoxes)
     }
 
-    const { threshold, includeAA } = toPixelmatchOptions(ignoreList)
+    const resolvedPixelmatch: ResolvedPixelmatchOptions = pixelmatchSettings ?? {
+        ...resolveComparePreset(ignoreList),
+        diffColor: DEFAULT_PIXELMATCH_OPTIONS.diffColor,
+        aaColor: DEFAULT_PIXELMATCH_OPTIONS.aaColor,
+        diffColorAlt: DEFAULT_PIXELMATCH_OPTIONS.diffColorAlt,
+        alpha: DEFAULT_PIXELMATCH_OPTIONS.alpha,
+        diffMask: DEFAULT_PIXELMATCH_OPTIONS.diffMask,
+        checkerboard: DEFAULT_PIXELMATCH_OPTIONS.checkerboard,
+    }
+
     const outputPixels = new Uint8Array(totalPixels * 4)
 
-    // Use magenta [255, 0, 255] for both diff and AA pixels.
     const diffCount: number = pixelmatch(pixels1, pixels2, outputPixels, width, height, {
-        threshold,
-        includeAA,
-        diffColor: [255, 0, 255],
-        aaColor: [255, 0, 255],
+        threshold: resolvedPixelmatch.threshold,
+        includeAA: resolvedPixelmatch.includeAA,
+        diffColor: resolvedPixelmatch.diffColor,
+        aaColor: resolvedPixelmatch.aaColor,
+        diffColorAlt: resolvedPixelmatch.diffColorAlt,
+        alpha: resolvedPixelmatch.alpha,
+        diffMask: resolvedPixelmatch.diffMask,
+        ...(resolvedPixelmatch.checkerboard !== undefined ? { checkerboard: resolvedPixelmatch.checkerboard } : {}),
     })
 
+    const { diffColor, aaColor, diffColorAlt, diffMask } = resolvedPixelmatch
+
     // Collect diff pixel coordinates from the output buffer.
-    // Both diff and AA pixels are drawn in magenta [255, 0, 255]; grayscale pixels are matches.
     const diffPixels: Array<{ x: number; y: number }> = []
     let left = width
     let top = height
@@ -153,7 +161,7 @@ export default async function compareImages(
     let bottom = 0
 
     for (let i = 0; i < outputPixels.length; i += 4) {
-        if (outputPixels[i] === 255 && outputPixels[i + 1] === 0 && outputPixels[i + 2] === 255) {
+        if (isHighlightedPixel(outputPixels, i, diffColor, aaColor, diffColorAlt)) {
             const pixelIndex = i / 4
             const x = pixelIndex % width
             const y = Math.floor(pixelIndex / width)
@@ -169,23 +177,28 @@ export default async function compareImages(
         ? { left, top, right, bottom }
         : { left: width, top: height, right: 0, bottom: 0 }
 
-    // Single-pass blend: paint diff pixels (magenta) on top of the actual screenshot.
-    // pixels2 is already in memory and normalised to the canvas size, so no extra decode needed.
     const getRawPixels = (): RawImage => {
         const data = new Uint8Array(totalPixels * 4)
+
+        if (diffMask) {
+            data.set(outputPixels)
+            return { data, width, height }
+        }
+
         for (let i = 0; i < data.length; i += 4) {
-            if (outputPixels[i] === 255 && outputPixels[i + 1] === 0 && outputPixels[i + 2] === 255) {
-                data[i]     = 255
-                data[i + 1] = 0
-                data[i + 2] = 255
-                data[i + 3] = 255
+            if (isHighlightedPixel(outputPixels, i, diffColor, aaColor, diffColorAlt)) {
+                data[i] = outputPixels[i]
+                data[i + 1] = outputPixels[i + 1]
+                data[i + 2] = outputPixels[i + 2]
+                data[i + 3] = outputPixels[i + 3] || 255
             } else {
-                data[i]     = displayPixels2[i]
+                data[i] = displayPixels2[i]
                 data[i + 1] = displayPixels2[i + 1]
                 data[i + 2] = displayPixels2[i + 2]
                 data[i + 3] = displayPixels2[i + 3]
             }
         }
+
         return { data, width, height }
     }
 

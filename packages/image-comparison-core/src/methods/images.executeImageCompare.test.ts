@@ -82,9 +82,13 @@ vi.mock('./createCompareReport.js', () => ({
 vi.mock('../pixelmatch/compareImages.js', () => ({
     default: vi.fn()
 }))
-vi.mock('../helpers/constants.js', () => ({
-    DEFAULT_RESIZE_DIMENSIONS: { top: 0, right: 0, bottom: 0, left: 0 }
-}))
+vi.mock('../helpers/constants.js', async (importOriginal) => {
+    const actual = await importOriginal() as Record<string, unknown>
+    return {
+        ...actual,
+        DEFAULT_RESIZE_DIMENSIONS: { top: 0, right: 0, bottom: 0, left: 0 },
+    }
+})
 vi.mock('process', () => ({
     argv: ['node', 'test.js']
 }))
@@ -101,6 +105,7 @@ vi.mock('./images.js', async () => {
 
 import { executeImageCompare, checkBaselineImageExists } from './images.js'
 import * as images from './images.js'
+import { CompareOptionsConflictError } from '../helpers/options.js'
 
 describe('executeImageCompare', () => {
     const mockDeviceRectangles = {
@@ -925,6 +930,69 @@ describe('executeImageCompare', () => {
         )
     })
 
+    it('should resolve ignoreLess over default antialiasing via last-wins preset order', async () => {
+        const { resolveComparePreset } = await import('../helpers/options.js')
+        const optionsWithIgnoreLess = {
+            ...mockOptions,
+            compareOptions: {
+                ...mockOptions.compareOptions,
+                method: {
+                    ignoreAntialiasing: true,
+                    ignoreLess: true,
+                }
+            }
+        }
+
+        await executeImageCompare({
+            isViewPortScreenshot: true,
+            isNativeContext: false,
+            options: optionsWithIgnoreLess,
+            testContext: mockTestContext
+        })
+
+        expect(compareImagesPixelmatch.default).toHaveBeenCalledWith(
+            expect.any(Buffer),
+            expect.any(Buffer),
+            {
+                ignore: ['antialiasing', 'less'],
+                scaleToSameSize: true
+            }
+        )
+        expect(resolveComparePreset(['antialiasing', 'less'])).toEqual({
+            threshold: 0.063,
+            includeAA: true,
+        })
+    })
+
+    it('should warn when multiple ignore options are enabled', async () => {
+        const optionsWithIgnoreLess = {
+            ...mockOptions,
+            compareOptions: {
+                ...mockOptions.compareOptions,
+                wic: {
+                    ...mockOptions.compareOptions.wic,
+                    ignoreAntialiasing: true,
+                },
+                method: {
+                    ignoreLess: true,
+                }
+            }
+        }
+
+        await executeImageCompare({
+            isViewPortScreenshot: true,
+            isNativeContext: false,
+            options: optionsWithIgnoreLess,
+            testContext: mockTestContext
+        })
+
+        expect(log.warn).toHaveBeenCalledWith(
+            expect.stringContaining('Multiple ignore* compare options are enabled'),
+            'ignoreAntialiasing, ignoreLess',
+            'ignoreLess',
+        )
+    })
+
     it('should handle ignore options from compareOptions', async () => {
         const optionsWithIgnore = {
             ...mockOptions,
@@ -1272,5 +1340,85 @@ describe('executeImageCompare', () => {
         })).rejects.toThrow(/If you need the actual image to create a baseline, please set alwaysSaveActualImage to true/)
 
         expect(images.saveBase64Image).not.toHaveBeenCalled()
+    })
+
+    it('should pass resolved pixelmatch options when configured at method level', async () => {
+        const pixelmatchOptions = {
+            ...mockOptions,
+            compareOptions: {
+                wic: {
+                    ...mockOptions.compareOptions.wic,
+                    scaleImagesToSameSize: false,
+                },
+                method: {
+                    pixelmatch: { threshold: 0.05, includeAA: true },
+                },
+            },
+        }
+
+        await executeImageCompare({
+            isViewPortScreenshot: true,
+            isNativeContext: false,
+            options: pixelmatchOptions,
+            testContext: mockTestContext,
+        })
+
+        expect(vi.mocked(compareImagesPixelmatch.default).mock.calls[0]?.[2]).toMatchSnapshot()
+        expect(log.warn).toHaveBeenCalledWith(
+            expect.stringContaining('Method compare options override service compare mode'),
+            'test',
+            expect.any(String),
+            expect.any(String),
+        )
+    })
+
+    it('should use preset mode when method ignore* overrides service pixelmatch', async () => {
+        const presetOverrideOptions = {
+            ...mockOptions,
+            compareOptions: {
+                wic: {
+                    ...mockOptions.compareOptions.wic,
+                    pixelmatch: { threshold: 0.1 },
+                },
+                method: {
+                    ignoreLess: true,
+                },
+            },
+        }
+
+        await executeImageCompare({
+            isViewPortScreenshot: true,
+            isNativeContext: false,
+            options: presetOverrideOptions,
+            testContext: { ...mockTestContext, commandName: 'checkElement' },
+        })
+
+        expect(vi.mocked(compareImagesPixelmatch.default).mock.calls[0]?.[2]).toMatchSnapshot()
+        expect(log.warn).toHaveBeenCalledWith(
+            expect.stringContaining('Method compare options override service compare mode'),
+            'checkElement',
+            expect.stringContaining('pixelmatch'),
+            expect.stringContaining('preset'),
+        )
+    })
+
+    it('should throw when method options combine ignore* with pixelmatch', async () => {
+        const conflictingMethodOptions = {
+            ...mockOptions,
+            compareOptions: {
+                ...mockOptions.compareOptions,
+                method: {
+                    ignoreLess: true,
+                    pixelmatch: { threshold: 0.05 },
+                },
+            },
+        }
+
+        await expect(executeImageCompare({
+            isViewPortScreenshot: true,
+            isNativeContext: false,
+            options: conflictingMethodOptions,
+            testContext: { ...mockTestContext, commandName: 'checkScreen' },
+        })).rejects.toThrow(CompareOptionsConflictError)
     })
 })
